@@ -8,6 +8,7 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { DataSource } from 'typeorm';
+import * as dns from 'dns';
 import { FabricService } from './fabric.service';
 
 interface ActiveNfcDevice {
@@ -52,6 +53,33 @@ export class AppController {
       .join(' ');
   }
 
+  private async verifyEmailDomainMx(email: string): Promise<boolean> {
+    const clean = (email || '').trim().toLowerCase();
+    const emailRegex = /^[^\s@]+@([^\s@]+\.[^\s@]{2,})$/;
+    const match = clean.match(emailRegex);
+    if (!match) return false;
+
+    const domain = match[1];
+    try {
+      const mxRecords = await dns.promises.resolveMx(domain);
+      return Array.isArray(mxRecords) && mxRecords.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private verifyValidMobilePhone(phone: string): boolean {
+    const digits = (phone || '').replace(/[^0-9]/g, '');
+    if (digits.length !== 10 || !digits.startsWith('3')) return false;
+    if (/^(\d)\1{9}$/.test(digits)) return false;
+    const prefix = parseInt(digits.substring(0, 3), 10);
+    return (
+      (prefix >= 300 && prefix <= 324) ||
+      prefix === 333 ||
+      (prefix >= 350 && prefix <= 351)
+    );
+  }
+
   // ==========================================
   // 1. ENDPOINT DE INICIO DE SESIÓN SEGURO
   // ==========================================
@@ -62,7 +90,7 @@ export class AppController {
 
     if (!correo || !pin) {
       throw new HttpException(
-        'Correo y contraseña requeridos',
+        'Correo y PIN de 4 dígitos requeridos',
         HttpStatus.BAD_REQUEST,
       );
     }
@@ -134,16 +162,38 @@ export class AppController {
   }
 
   // ==========================================
-  // 2. ENDPOINT DE REGISTRO SEGURO
+  // 2. ENDPOINT DE REGISTRO SEGURO (CON VERIFICACIÓN DE CORREO, TELÉFONO Y PIN DE 4 DÍGITOS)
   // ==========================================
   @Post('registro')
   async registrar(@Body() body: any) {
     const { nombre, tipo_documento, documento, correo, telefono, pin_hash } =
       body || {};
 
-    if (!nombre || !documento || !correo || !pin_hash) {
+    if (!nombre || !documento || !correo || !telefono || !pin_hash) {
       throw new HttpException(
         'Todos los campos obligatorios deben ser enviados.',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    if (!/^[0-9]{4}$/.test(String(pin_hash))) {
+      throw new HttpException(
+        'El PIN debe tener exactamente 4 dígitos numéricos.',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    if (!this.verifyValidMobilePhone(String(telefono))) {
+      throw new HttpException(
+        'El número de teléfono no corresponde a una línea móvil válida.',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const emailMxValid = await this.verifyEmailDomainMx(String(correo));
+    if (!emailMxValid) {
+      throw new HttpException(
+        'El dominio del correo electrónico no existe o no tiene servidores de correo activos.',
         HttpStatus.BAD_REQUEST,
       );
     }
@@ -158,7 +208,7 @@ export class AppController {
           documento,
           correo,
           telefono,
-          pin_hash,
+          String(pin_hash),
         ],
       );
 
@@ -167,22 +217,25 @@ export class AppController {
       console.error('Error al registrar usuario:', error);
 
       throw new HttpException(
-        'Error al registrar. Verifica que el correo o documento no estén duplicados.',
+        'Error al registrar. Verifica que el correo, teléfono o documento no estén duplicados.',
         HttpStatus.BAD_REQUEST,
       );
     }
   }
 
   // ==========================================
-  // 3. VERIFICAR PIN PARA REVELAR DATOS DEL PERFIL
+  // 3. VERIFICAR PIN (PARA REVELAR DATOS O AUTORIZAR TRANSFERENCIA)
   // ==========================================
   @Post('verificar-pin')
   async verificarPin(
     @Body() body: { id_usuario?: number; correo?: string; pin: string },
   ) {
     const { id_usuario, correo, pin } = body || {};
-    if (!pin) {
-      throw new HttpException('PIN requerido', HttpStatus.BAD_REQUEST);
+    if (!pin || !/^[0-9]{4}$/.test(String(pin))) {
+      throw new HttpException(
+        'Se requiere un PIN numérico de 4 dígitos.',
+        HttpStatus.BAD_REQUEST,
+      );
     }
 
     const rows = await this.dataSource.query(
@@ -192,12 +245,12 @@ export class AppController {
        WHERE ($2::int IS NOT NULL AND id_usuario = $2::int)
           OR ($3::text IS NOT NULL AND lower(correo) = lower(trim($3::text)))
        LIMIT 1`,
-      [pin, id_usuario || null, correo || null],
+      [String(pin), id_usuario || null, correo || null],
     );
 
     if (rows.length === 0 || !rows[0].pin_valido) {
       throw new HttpException(
-        'PIN incorrecto. No se pudieron revelar los datos.',
+        'PIN incorrecto. No se pudo autorizar la operación.',
         HttpStatus.UNAUTHORIZED,
       );
     }
@@ -246,7 +299,7 @@ export class AppController {
         id_usuario: myId,
         nombre: body.nombre || 'Usuario SPCC',
         correo: body.correo || '',
-        banco: body.banco || 'Bancolombia',
+        banco: body.banco || 'SPCC',
         nfc_tag_id: body.nfc_tag_id,
         lastSeen: now,
       });
@@ -312,7 +365,6 @@ export class AppController {
       );
     }
 
-    // Si no se especificó receptor o es igual al emisor, buscar otro usuario registrado en la BD
     if (!idReceptor || idReceptor === idEmisor) {
       const otros = await this.dataSource.query(
         `SELECT id_usuario, nombre FROM public.usuario WHERE id_usuario <> $1 ORDER BY id_usuario ASC LIMIT 1`,
@@ -327,7 +379,6 @@ export class AppController {
       idReceptor = otros[0].id_usuario;
     }
 
-    // Consultar nombres reales de emisor y receptor
     const usuarios = await this.dataSource.query(
       `SELECT id_usuario, nombre FROM public.usuario WHERE id_usuario IN ($1, $2)`,
       [idEmisor, idReceptor],
@@ -342,13 +393,11 @@ export class AppController {
       receptorObj?.nombre || 'Receptor SPCC',
     );
 
-    // Obtener el hash anterior de registro_auditoria para encadenarlo en Hyperledger Fabric
     const prevAuditRows = await this.dataSource.query(
       `SELECT hash FROM public.registro_auditoria ORDER BY id_registro DESC LIMIT 1`,
     );
     const prevHash = prevAuditRows.length > 0 ? prevAuditRows[0].hash : null;
 
-    // 1. Insertar la transacción en PostgreSQL (el trigger trg_auditar_transaccion_blockchain también audita en BD)
     const claveIdempotencia = `nfc_${idEmisor}_${idReceptor}_${Date.now()}`;
     const insertRows = await this.dataSource.query(
       `INSERT INTO public.transaccion (
@@ -365,7 +414,6 @@ export class AppController {
 
     const nuevaTx = insertRows[0];
 
-    // 2. Registrar en Hyperledger Fabric (Chaincode SpccAuditContract)
     const fabricAudit = await this.fabricService.registrarEventoEnBlockchain({
       idTransaccion: nuevaTx.id_transaccion,
       idEmisor,
@@ -376,7 +424,6 @@ export class AppController {
       hashAnterior: prevHash,
     });
 
-    // Obtener el hash final almacenado en registro_auditoria
     const auditRows = await this.dataSource.query(
       `SELECT hash, hash_anterior FROM public.registro_auditoria WHERE id_transaccion = $1 ORDER BY id_registro DESC LIMIT 1`,
       [nuevaTx.id_transaccion],
@@ -389,12 +436,11 @@ export class AppController {
       minute: '2-digit',
     });
 
-    // 3. Encolar notificación en vivo para el celular Receptor
     const list = this.incomingTransfers.get(idReceptor) || [];
     list.push({
       id_transaccion: Number(nuevaTx.id_transaccion),
       emisor_nombre: nombreEmisorCensurado,
-      banco: body?.banco_destino || 'Bancolombia',
+      banco: body?.banco_destino || 'SPCC',
       monto,
       hash_auditoria: finalHash,
       time: horaFormateada,
@@ -410,7 +456,7 @@ export class AppController {
         id_usuario_receptor: idReceptor,
         emisor_nombre: nombreEmisorCensurado,
         receptor_nombre: nombreReceptorCensurado,
-        banco: body?.banco_destino || 'Davivienda',
+        banco: body?.banco_destino || 'SPCC',
         monto,
         estado: 'Aprobada',
         time: horaFormateada,
