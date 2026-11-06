@@ -2,7 +2,10 @@ import {
   Controller,
   Post,
   Get,
+  Put,
+  Delete,
   Param,
+  Query,
   Body,
   HttpException,
   HttpStatus,
@@ -162,7 +165,7 @@ export class AppController {
   }
 
   // ==========================================
-  // 2. ENDPOINT DE REGISTRO SEGURO (CON VERIFICACIÓN DE CORREO, TELÉFONO Y PIN DE 4 DÍGITOS)
+  // 2. ENDPOINT DE REGISTRO SEGURO (CREATE USUARIO)
   // ==========================================
   @Post('registro')
   async registrar(@Body() body: any) {
@@ -221,6 +224,56 @@ export class AppController {
         HttpStatus.BAD_REQUEST,
       );
     }
+  }
+
+  // ==========================================
+  // 2B. ACTUALIZAR PERFIL DE USUARIO (UPDATE USUARIO)
+  // ==========================================
+  @Put('usuario/:idUsuario')
+  async actualizarUsuario(
+    @Param('idUsuario') idUsuarioParam: string,
+    @Body() body: { nombre?: string; telefono?: string },
+  ) {
+    const idUsuario = Number(idUsuarioParam);
+    if (!idUsuario) {
+      throw new HttpException('ID de usuario inválido.', HttpStatus.BAD_REQUEST);
+    }
+
+    const nombre = body?.nombre?.trim();
+    const telefono = body?.telefono?.trim();
+
+    if (!nombre && !telefono) {
+      throw new HttpException(
+        'Debes enviar al menos el nombre o el teléfono a actualizar.',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    if (telefono && !this.verifyValidMobilePhone(telefono)) {
+      throw new HttpException(
+        'El número de teléfono no corresponde a una línea móvil válida de 10 dígitos.',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const updated = await this.dataSource.query(
+      `UPDATE public.usuario
+       SET nombre = COALESCE($1, nombre),
+           telefono = COALESCE($2, telefono)
+       WHERE id_usuario = $3
+       RETURNING id_usuario, nombre, tipo_documento, documento, correo, telefono`,
+      [nombre || null, telefono || null, idUsuario],
+    );
+
+    if (updated.length === 0) {
+      throw new HttpException('Usuario no encontrado.', HttpStatus.NOT_FOUND);
+    }
+
+    return {
+      success: true,
+      message: 'Datos de usuario actualizados correctamente',
+      usuario: updated[0],
+    };
   }
 
   // ==========================================
@@ -286,7 +339,6 @@ export class AppController {
     const now = Date.now();
     const EXPIRY_MS = 25000;
 
-    // Limpiar sesiones inactivas (> 25s)
     for (const [uid, sess] of this.activeNfcSessions.entries()) {
       if (now - sess.lastSeen > EXPIRY_MS) {
         this.activeNfcSessions.delete(uid);
@@ -305,7 +357,6 @@ export class AppController {
       });
     }
 
-    // Buscar otro dispositivo que esté activo simultáneamente en la pantalla de transferencia
     let peerDevice: any = null;
     for (const [uid, sess] of this.activeNfcSessions.entries()) {
       if (uid !== myId && now - sess.lastSeen <= EXPIRY_MS) {
@@ -319,7 +370,6 @@ export class AppController {
       }
     }
 
-    // Revisar si este dispositivo acaba de recibir una transferencia entrante
     const pending = this.incomingTransfers.get(myId) || [];
     if (pending.length > 0) {
       this.incomingTransfers.delete(myId);
@@ -358,9 +408,9 @@ export class AppController {
     let idReceptor = Number(body?.id_usuario_receptor);
     const monto = Number(body?.monto);
 
-    if (!idEmisor || isNaN(monto) || monto <= 0) {
+    if (!idEmisor || isNaN(monto) || monto < 1 || !Number.isInteger(monto)) {
       throw new HttpException(
-        'Datos de transferencia inválidos (monto debe ser mayor a 0).',
+        'Datos de transferencia inválidos (el monto mínimo es 1 y debe ser un número entero).',
         HttpStatus.BAD_REQUEST,
       );
     }
@@ -468,14 +518,44 @@ export class AppController {
   }
 
   // ==========================================
-  // 6. HISTORIAL DE TRANSACCIONES POR USUARIO (SALIDAS E INGRESOS)
+  // 6. HISTORIAL DE TRANSACCIONES CON FILTROS Y PAGINACIÓN EN SQL
   // ==========================================
   @Get('transacciones/:idUsuario')
-  async obtenerTransacciones(@Param('idUsuario') idUsuarioParam: string) {
+  async obtenerTransacciones(
+    @Param('idUsuario') idUsuarioParam: string,
+    @Query('tipo') tipoParam?: string,
+    @Query('page') pageParam?: string,
+    @Query('limit') limitParam?: string,
+  ) {
     const idUsuario = Number(idUsuarioParam);
     if (!idUsuario) {
-      return { success: true, transacciones: [] };
+      return {
+        success: true,
+        transacciones: [],
+        paginacion: { page: 1, limit: 10, total: 0, totalPages: 1, hasMore: false },
+      };
     }
+
+    const tipo = (tipoParam || 'all').toLowerCase();
+    const page = Math.max(1, parseInt(pageParam || '1', 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(limitParam || '10', 10) || 10));
+    const offset = (page - 1) * limit;
+
+    let whereClause = `(t.id_usuario_emisor = $1 OR t.id_usuario_receptor = $1)`;
+    if (tipo === 'sent') {
+      whereClause = `t.id_usuario_emisor = $1`;
+    } else if (tipo === 'received') {
+      whereClause = `t.id_usuario_receptor = $1`;
+    }
+
+    const countRows = await this.dataSource.query(
+      `SELECT COUNT(*)::int AS total
+       FROM public.transaccion t
+       WHERE ${whereClause}`,
+      [idUsuario],
+    );
+    const total = countRows[0]?.total || 0;
+    const totalPages = Math.max(1, Math.ceil(total / limit));
 
     const rows = await this.dataSource.query(
       `SELECT
@@ -496,9 +576,10 @@ export class AppController {
          WHERE id_transaccion = t.id_transaccion
          ORDER BY id_registro DESC LIMIT 1
        ) ra ON true
-       WHERE t.id_usuario_emisor = $1 OR t.id_usuario_receptor = $1
-       ORDER BY t.creado_en DESC`,
-      [idUsuario],
+       WHERE ${whereClause}
+       ORDER BY t.creado_en DESC
+       LIMIT $2 OFFSET $3`,
+      [idUsuario, limit, offset],
     );
 
     const transacciones = rows.map((r: any) => {
@@ -531,6 +612,192 @@ export class AppController {
     return {
       success: true,
       transacciones,
+      paginacion: {
+        page,
+        limit,
+        total,
+        totalPages,
+        hasMore: page < totalPages,
+      },
+    };
+  }
+
+  // ==========================================
+  // 7. CRUD COMPLETO DE TARJETAS TOKENIZADAS (CREATE, READ, UPDATE, DELETE)
+  // ==========================================
+  @Post('tarjetas')
+  async crearTarjeta(
+    @Body()
+    body: {
+      id_usuario: number;
+      banco: string;
+      token: string;
+      ultimos4: string;
+      vencimiento?: string;
+      isDefault?: boolean;
+    },
+  ) {
+    const idUsuario = Number(body?.id_usuario);
+    const bancoNombre = (body?.banco || '').trim();
+    const token = (body?.token || '').trim();
+    const ultimos4 = (body?.ultimos4 || '').trim();
+    const vencimiento = (body?.vencimiento || '12/28').trim();
+    const isDefault = Boolean(body?.isDefault);
+
+    if (!idUsuario || !bancoNombre || !token || !/^[0-9]{4}$/.test(ultimos4)) {
+      throw new HttpException(
+        'Datos de tarjeta inválidos. Verifica el token, banco y los últimos 4 dígitos.',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const parts = vencimiento.split('/');
+    const expMes = Math.min(12, Math.max(1, parseInt(parts[0] || '12', 10) || 12));
+    let expAnio = parseInt(parts[1] || '28', 10) || 2028;
+    if (expAnio < 100) expAnio += 2000;
+
+    // Buscar o crear el banco emisor en public.banco
+    let bancoRows = await this.dataSource.query(
+      `SELECT id_banco FROM public.banco WHERE lower(nombre) = lower($1) LIMIT 1`,
+      [bancoNombre],
+    );
+    if (bancoRows.length === 0) {
+      const codigo = bancoNombre.substring(0, 4).toUpperCase() + Math.floor(100 + Math.random() * 900);
+      bancoRows = await this.dataSource.query(
+        `INSERT INTO public.banco (nombre, codigo_bancario) VALUES ($1, $2) RETURNING id_banco`,
+        [bancoNombre, codigo],
+      );
+    }
+    const idBanco = bancoRows[0].id_banco;
+
+    if (isDefault) {
+      await this.dataSource.query(
+        `UPDATE public.tarjeta_token SET alias = 'SECUNDARIA' WHERE id_usuario = $1`,
+        [idUsuario],
+      );
+    }
+
+    const inserted = await this.dataSource.query(
+      `INSERT INTO public.tarjeta_token (
+         id_usuario, id_banco_emisor, token, ultimos4, alias, marca, exp_mes, exp_anio, activa
+       ) VALUES ($1, $2, $3, $4, $5, 'VISA', $6, $7, TRUE)
+       ON CONFLICT (token) DO UPDATE
+         SET ultimos4 = EXCLUDED.ultimos4,
+             alias = EXCLUDED.alias,
+             activa = TRUE
+       RETURNING id_tarjeta, token, ultimos4, alias, exp_mes, exp_anio`,
+      [
+        idUsuario,
+        idBanco,
+        token,
+        ultimos4,
+        isDefault ? 'PREDETERMINADA' : 'SECUNDARIA',
+        expMes,
+        expAnio,
+      ],
+    );
+
+    const row = inserted[0];
+    return {
+      success: true,
+      tarjeta: {
+        id_tarjeta: row.id_tarjeta,
+        banco: bancoNombre,
+        token: row.token,
+        ultimos4: row.ultimos4,
+        vencimiento: `${String(row.exp_mes).padStart(2, '0')}/${String(row.exp_anio).slice(-2)}`,
+        isDefault: row.alias === 'PREDETERMINADA',
+      },
+    };
+  }
+
+  @Get('tarjetas/:idUsuario')
+  async listarTarjetas(@Param('idUsuario') idUsuarioParam: string) {
+    const idUsuario = Number(idUsuarioParam);
+    if (!idUsuario) {
+      return { success: true, tarjetas: [] };
+    }
+
+    const rows = await this.dataSource.query(
+      `SELECT tt.id_tarjeta, tt.token, tt.ultimos4, tt.alias, tt.exp_mes, tt.exp_anio,
+              b.nombre AS banco
+       FROM public.tarjeta_token tt
+       INNER JOIN public.banco b ON b.id_banco = tt.id_banco_emisor
+       WHERE tt.id_usuario = $1 AND tt.activa = TRUE
+       ORDER BY (tt.alias = 'PREDETERMINADA') DESC, tt.creado_en DESC`,
+      [idUsuario],
+    );
+
+    return {
+      success: true,
+      tarjetas: rows.map((r: any) => ({
+        id: `db-card-${r.id_tarjeta}`,
+        id_tarjeta: r.id_tarjeta,
+        banco: r.banco,
+        token: r.token,
+        ultimos4: r.ultimos4,
+        vencimiento: `${String(r.exp_mes).padStart(2, '0')}/${String(r.exp_anio).slice(-2)}`,
+        isDefault: r.alias === 'PREDETERMINADA',
+      })),
+    };
+  }
+
+  @Put('tarjetas/:idTarjeta')
+  async actualizarTarjeta(
+    @Param('idTarjeta') idTarjetaParam: string,
+    @Body() body: { id_usuario?: number; isDefault?: boolean },
+  ) {
+    const idTarjeta = Number(idTarjetaParam);
+    if (!idTarjeta) {
+      throw new HttpException('ID de tarjeta inválido.', HttpStatus.BAD_REQUEST);
+    }
+
+    if (body?.isDefault && body?.id_usuario) {
+      await this.dataSource.query(
+        `UPDATE public.tarjeta_token SET alias = 'SECUNDARIA' WHERE id_usuario = $1`,
+        [Number(body.id_usuario)],
+      );
+    }
+
+    const rows = await this.dataSource.query(
+      `UPDATE public.tarjeta_token
+       SET alias = CASE WHEN $1::boolean IS TRUE THEN 'PREDETERMINADA' ELSE alias END
+       WHERE id_tarjeta = $2
+       RETURNING id_tarjeta, ultimos4, alias`,
+      [Boolean(body?.isDefault), idTarjeta],
+    );
+
+    if (rows.length === 0) {
+      throw new HttpException('Tarjeta no encontrada.', HttpStatus.NOT_FOUND);
+    }
+
+    return {
+      success: true,
+      message: 'Tarjeta actualizada correctamente',
+      tarjeta: rows[0],
+    };
+  }
+
+  @Delete('tarjetas/:idTarjeta')
+  async eliminarTarjeta(@Param('idTarjeta') idTarjetaParam: string) {
+    const idTarjeta = Number(idTarjetaParam);
+    if (!idTarjeta) {
+      throw new HttpException('ID de tarjeta inválido.', HttpStatus.BAD_REQUEST);
+    }
+
+    const deleted = await this.dataSource.query(
+      `DELETE FROM public.tarjeta_token WHERE id_tarjeta = $1 RETURNING id_tarjeta`,
+      [idTarjeta],
+    );
+
+    if (deleted.length === 0) {
+      throw new HttpException('Tarjeta no encontrada.', HttpStatus.NOT_FOUND);
+    }
+
+    return {
+      success: true,
+      message: 'Tarjeta eliminada correctamente',
+      id_tarjeta: deleted[0].id_tarjeta,
     };
   }
 }
